@@ -45,3 +45,7 @@ def max_diff(dl_gdf_idx, orig_gdf_idx, nx, ny):
 COMPARISON_METHODS = {
     "max": max_diff
 }
+
+def compare(orig_gdf_idx, dl_gdf_idx, nx, ny, method="max"):
+    fn = COMPARISON_METHODS[method]
+    return fn(dl_gdf_idx, orig_gdf_idx, nx, ny)
