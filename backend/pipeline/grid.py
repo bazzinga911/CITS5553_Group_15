@@ -40,15 +40,18 @@ def ensure_projected(gdf: gpd.GeoDataFrame, target_crs: str = DEFAULT_PROJECTED_
 
 def make_grid_spec(orig: gpd.GeoDataFrame, dl: gpd.GeoDataFrame, cell_size_m: int, crs: str) -> GridSpec:
     """Compute combined bounds and grid dimensions in the projected CRS."""
-    bounds = gpd.GeoSeries(pd=None, crs=crs)
-    # union bounds
     minx1, miny1, maxx1, maxy1 = orig.total_bounds
     minx2, miny2, maxx2, maxy2 = dl.total_bounds
-    minx = min(minx1, minx2); miny = min(miny1, miny2)
-    maxx = max(maxx1, maxx2); maxy = max(maxy1, maxy2)
-    width = maxx - minx; height = maxy - miny
-    nx = _ceil_div(width, cell_size_m)
+    minx = min(minx1, minx2)
+    miny = min(miny1, miny2)
+    maxx = max(maxx1, maxx2)
+    maxy = max(maxy1, maxy2)
+
+    width  = maxx - minx
+    height = maxy - miny
+    nx = _ceil_div(width,  cell_size_m)
     ny = _ceil_div(height, cell_size_m)
+
     return GridSpec(minx=minx, miny=miny, cell=cell_size_m, nx=nx, ny=ny, crs=crs)
 
 

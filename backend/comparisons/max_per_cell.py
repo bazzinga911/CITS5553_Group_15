@@ -4,8 +4,6 @@ Comparison methods (currently only MAX) for grid-based geochemical data.
 """
 
 import numpy as np
-from scipy.stats import chisquare
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helper
