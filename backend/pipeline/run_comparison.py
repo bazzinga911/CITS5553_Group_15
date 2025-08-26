@@ -1,80 +1,104 @@
+# backend/pipeline/run_comparison.py
 """
-Pipeline entrypoint: orchestrates reading input Parquet files,
-gridding, assigning Grid_IDs, running comparisons, and writing outputs.
+Run the comparison pipeline:
+- Read two GeoParquets (Orig, DL)
+- Project to EPSG:3577 (AU Albers)
+- Build regular grid (cell size in km)
+- Assign grid_ix/grid_iy/Grid_ID to samples
+- Call comparison (max for v1)
+- Write 3 GeoParquet grids + done flag
 
 Usage:
-    python -m backend.pipeline.run_comparison \
-        --orig path/to/orig.parquet \
-        --dl path/to/dl.parquet \
-        --out results/ \
-        --cell-km 100 \
-        --method max
+  python -m backend.pipeline.run_comparison \
+      --orig path/or/s3://.../orig.parquet \
+      --dl   path/or/s3://.../dl.parquet \
+      --out  path/or/s3://.../results/ \
+      --cell-km 100 \
+      --method max
 """
 
 import argparse
 import os
+import pandas as pd
 import geopandas as gpd
+
 from backend.comparisons.max_per_cell import compare
-from backend.pipeline.grid import make_regular_grid, assign_grid_id
-from backend.pipeline.io_s3 import read_points, write_grid
+from backend.pipeline.grid import (
+    DEFAULT_PROJECTED_CRS, ensure_projected,
+    make_grid_spec, make_regular_grid, assign_grid_index
+)
+from backend.pipeline.io_s3 import read_points, write_grid, write_text
+
+
+def _is_s3(path: str) -> bool:
+    return path.lower().startswith("s3://")
+
+
+def _join_arrays_to_grid(grid: gpd.GeoDataFrame, arr_orig, arr_dl, arr_cmp, nx: int, ny: int) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """
+    For each cell (iy, ix), set columns from the corresponding array index.
+    Assumes grid has columns 'ix' and 'iy'.
+    """
+    g = grid.copy()
+    g["orig_max"] = arr_orig[g["iy"], g["ix"]]
+    g["dl_max"]   = arr_dl[g["iy"], g["ix"]]
+    g["delta"]    = arr_cmp[g["iy"], g["ix"]]
+
+    orig_grid = g[["Grid_ID", "orig_max", "geometry"]].copy()
+    dl_grid   = g[["Grid_ID", "dl_max", "geometry"]].copy()
+    comp_grid = g[["Grid_ID", "delta", "geometry"]].copy()
+    return orig_grid, dl_grid, comp_grid
 
 
 def main():
-    # ------------------------------------------------------------------
-    # 1. Parse CLI arguments
-    # ------------------------------------------------------------------
     parser = argparse.ArgumentParser(description="Run comparison pipeline.")
-    parser.add_argument("--orig", required=True, help="Path to Original dataset (Parquet/GeoParquet)")
-    parser.add_argument("--dl", required=True, help="Path to DL dataset (Parquet/GeoParquet)")
-    parser.add_argument("--out", required=True, help="Output folder (local or s3://)")
-    parser.add_argument("--cell-km", type=int, default=100, help="Cell size in kilometres (default: 100 km)")
-    parser.add_argument("--method", choices=["max"], default="max", help="Comparison method (default: max)")
+    parser.add_argument("--orig", required=True, help="Original dataset (GeoParquet)")
+    parser.add_argument("--dl",   required=True, help="DL dataset (GeoParquet)")
+    parser.add_argument("--out",  required=True, help="Output folder (local or s3://)")
+    parser.add_argument("--cell-km", type=int, default=100, help="Grid cell size in km")
+    parser.add_argument("--method", choices=["max"], default="max", help="Comparison method (v1: max)")
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # 2. Read inputs
-    # ------------------------------------------------------------------
-    orig = read_points(args.orig)   # GeoDataFrame with Te_ppm + geometry
+    # 1) Read inputs
+    orig = read_points(args.orig)
     dl   = read_points(args.dl)
+    req_cols = {"Te_ppm", orig.geometry.name}
+    for name, gdf in [("orig", orig), ("dl", dl)]:
+        if "Te_ppm" not in gdf.columns:
+            raise ValueError(f"{name} is missing 'Te_ppm' column")
+        if gdf.geometry is None:
+            raise ValueError(f"{name} is missing 'geometry' column")
 
-    # ------------------------------------------------------------------
-    # 3. Build grid
-    # ------------------------------------------------------------------
-    cell_size_m = args.cell_km * 1000
-    bounds = gpd.GeoSeries(pd.concat([orig.geometry, dl.geometry])).total_bounds
-    grid = make_regular_grid(bounds=bounds, cell_size_m=cell_size_m, crs=orig.crs)
+    # 2) Project to meter CRS
+    orig = ensure_projected(orig, DEFAULT_PROJECTED_CRS)
+    dl   = ensure_projected(dl,   DEFAULT_PROJECTED_CRS)
 
-    # Derive grid dimensions (nx, ny)
-    minx, miny, maxx, maxy = bounds
-    nx = int((maxx - minx) // cell_size_m) + 1
-    ny = int((maxy - miny) // cell_size_m) + 1
+    # 3) Grid spec + grid polygons
+    cell_m = int(args.cell_km) * 1000
+    spec = make_grid_spec(orig, dl, cell_m, str(orig.crs))
+    grid = make_regular_grid(spec)
 
-    # ------------------------------------------------------------------
-    # 4. Assign Grid_IDs
-    # ------------------------------------------------------------------
-    orig_idx = assign_grid_id(orig, grid)
-    dl_idx   = assign_grid_id(dl, grid)
+    # 4) Assign indices to points (vectorised)
+    orig_idx = assign_grid_index(orig, spec)
+    dl_idx   = assign_grid_index(dl,   spec)
 
-    # ------------------------------------------------------------------
-    # 5. Compare
-    # ------------------------------------------------------------------
-    arr_orig, arr_dl, arr_cmp = compare(orig_idx, dl_idx, nx=nx, ny=ny, method=args.method)
+    # 5) Compare (Anthony’s algorithm wrapped via our API)
+    arr_orig, arr_dl, arr_cmp = compare(orig_idx, dl_idx, nx=spec.nx, ny=spec.ny, method=args.method)
 
-    # ------------------------------------------------------------------
-    # 6. Write outputs
-    # ------------------------------------------------------------------
-    outdir = args.out
-    os.makedirs(outdir, exist_ok=True)
+    # 6) Join arrays back to polygons
+    orig_grid, dl_grid, comp_grid = _join_arrays_to_grid(grid, arr_orig, arr_dl, arr_cmp, spec.nx, spec.ny)
 
-    write_grid(os.path.join(outdir, "orig_grid.parquet"), arr_orig)
-    write_grid(os.path.join(outdir, "dl_grid.parquet"), arr_dl)
-    write_grid(os.path.join(outdir, "comp_grid.parquet"), arr_cmp)
+    # 7) Write outputs
+    outdir = args.out.rstrip("/")
+    if not _is_s3(outdir):
+        os.makedirs(outdir, exist_ok=True)
 
-    # Done flag (for UI)
-    with open(os.path.join(outdir, "done.flag"), "w") as f:
-        f.write("done")
+    write_grid(f"{outdir}/orig_grid.parquet", orig_grid)
+    write_grid(f"{outdir}/dl_grid.parquet",   dl_grid)
+    write_grid(f"{outdir}/comp_grid.parquet", comp_grid)
+    write_text(f"{outdir}/done.flag", "done")
 
-    print("Pipeline finished")
+    print(f"✅ Finished: wrote 3 grids + done.flag to {outdir}")
 
 
 if __name__ == "__main__":
