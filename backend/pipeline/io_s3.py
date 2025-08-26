@@ -1,25 +1,15 @@
-"""
-I/O helpers for reading/writing GeoParquet files (local or S3).
-"""
-
+# backend/pipeline/io_s3.py
 import geopandas as gpd
 import fsspec
 
+def read_points(path: str) -> gpd.GeoDataFrame:
+    with fsspec.open(path, "rb") as f:
+        return gpd.read_parquet(f)
 
-def read_points(path):
-    """
-    Read a GeoParquet file into a GeoDataFrame.
-    Works with local paths or s3:// URIs (requires s3fs).
-    """
-    with fsspec.open(path) as f:
-        gdf = gpd.read_parquet(f)
-    return gdf
-
-
-def write_grid(path, gdf):
-    """
-    Write a GeoDataFrame to GeoParquet.
-    Works with local paths or s3:// URIs (requires s3fs).
-    """
+def write_grid(path: str, gdf: gpd.GeoDataFrame) -> None:
     with fsspec.open(path, "wb") as f:
         gdf.to_parquet(f, index=False)
+
+def write_text(path: str, text: str) -> None:
+    with fsspec.open(path, "w") as f:
+        f.write(text)
